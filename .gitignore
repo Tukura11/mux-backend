@@ -65,3 +65,6 @@ src/generated/prisma/
 # Personal notes
 vrickish.md
 somzilla.md
+
+# Generated OpenAPI spec (produced by scripts/generate-openapi.ts)
+openapi.json

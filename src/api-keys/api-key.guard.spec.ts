@@ -1,4 +1,5 @@
 import { Reflector } from '@nestjs/core';
+import { UnauthorizedException } from '@nestjs/common';
 import { ApiKeyGuard, REQUIRE_API_KEY, IS_PUBLIC } from './api-key.guard';
 import { ApiKeyService } from './api-key.service';
 
@@ -123,5 +124,69 @@ describe('ApiKeyGuard', () => {
     await expect(guard.canActivate(context)).rejects.toThrow(
       'API key validation service unavailable',
     );
+  });
+
+  it('fails closed (503) when the API key store is unavailable during cursor import authz', async () => {
+    jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(false);
+    jest.spyOn(reflector, 'get').mockReturnValue(true);
+
+    // Simulate a dependency outage (DB/Horizon) surfacing as a non-auth error.
+    (mockApiKeyService.validateApiKey as jest.Mock) = jest.fn(async () => {
+      throw new Error('Horizon unavailable');
+    });
+
+    const req: any = {
+      headers: {
+        authorization: 'ApiKey mux_test_abc',
+        'user-agent': 'jest',
+      },
+      path: '/horizon/import/cursor',
+      method: 'POST',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+      query: { userId: 'attacker-supplied-id' },
+      body: { userId: 'attacker-supplied-id' },
+    };
+
+    const context: any = {
+      getHandler: () => undefined,
+      getClass: () => undefined,
+      switchToHttp: () => ({ getRequest: () => req }),
+    };
+
+    await expect(guard.canActivate(context)).rejects.toThrow(
+      'API key validation service unavailable',
+    );
+    // Deny-by-default: no cursor context is attached on failure.
+    expect(req.apiKeyContext).toBeUndefined();
+  });
+
+  it('rejects cursor advancement when the API key is revoked (deny-by-default)', async () => {
+    jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(false);
+    jest.spyOn(reflector, 'get').mockReturnValue(true);
+
+    (mockApiKeyService.validateApiKey as jest.Mock) = jest.fn(async () => {
+      throw new Error('Unauthorized');
+    });
+
+    const req: any = {
+      headers: {
+        authorization: 'ApiKey mux_revoked',
+        'user-agent': 'jest',
+      },
+      path: '/horizon/import/cursor',
+      method: 'POST',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    };
+
+    const context: any = {
+      getHandler: () => undefined,
+      getClass: () => undefined,
+      switchToHttp: () => ({ getRequest: () => req }),
+    };
+
+    await expect(guard.canActivate(context)).rejects.toThrow();
+    expect(req.apiKeyContext).toBeUndefined();
   });
 });

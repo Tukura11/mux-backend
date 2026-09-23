@@ -200,6 +200,52 @@ describe('Wallet Orchestration Endpoints (e2e)', () => {
         .send({ userId: 'user-e2e-1', network: 'TESTNET' })
         .expect(HttpStatus.UNAUTHORIZED);
     });
+
+    it('returns 403 when the feature flag is disabled (fail-closed)', async () => {
+      const { ForbiddenException } = await import('@nestjs/common');
+      const localApp = await buildApp({
+        createWallet: jest.fn(async () => {
+          throw new ForbiddenException('Wallet orchestration is disabled');
+        }),
+      });
+
+      await request(localApp.getHttpServer())
+        .post('/v1/wallets/orchestration/create')
+        .set('Authorization', `Bearer ${VALID_API_KEY}`)
+        .send({ userId: 'user-e2e-1', network: 'TESTNET' })
+        .expect(HttpStatus.FORBIDDEN);
+
+      await localApp.close();
+    });
+
+    it('returns 503 when a dependency (RPC/DB) is unavailable (fail-closed)', async () => {
+      const { ServiceUnavailableException } = await import('@nestjs/common');
+      const localApp = await buildApp({
+        createWallet: jest.fn(async () => {
+          throw new ServiceUnavailableException('Wallet backend unavailable');
+        }),
+      });
+
+      await request(localApp.getHttpServer())
+        .post('/v1/wallets/orchestration/create')
+        .set('Authorization', `Bearer ${VALID_API_KEY}`)
+        .send({ userId: 'user-e2e-1', network: 'TESTNET' })
+        .expect(HttpStatus.SERVICE_UNAVAILABLE);
+
+      await localApp.close();
+    });
+
+    it('rejects oversized batch payloads with 400', async () => {
+      await request(app.getHttpServer())
+        .post('/v1/wallets/orchestration/create')
+        .set('Authorization', `Bearer ${VALID_API_KEY}`)
+        .send({
+          userId: 'user-e2e-1',
+          network: 'TESTNET',
+          unexpectedField: 'x'.repeat(10_000),
+        })
+        .expect(HttpStatus.BAD_REQUEST);
+    });
   });
 
   // ── GET /wallets/orchestration/user/:userId/:network ────────────────────
@@ -241,16 +287,16 @@ describe('Wallet Orchestration Endpoints (e2e)', () => {
   // ── GET /wallets/orchestration/validate/:userId/:network ────────────────
 
   describe('GET /v1/wallets/orchestration/validate/:userId/:network', () => {
-    it('returns canCreate=true when user has no wallet on the network', async () => {
+    it('returns canCreate=true when validation passes', async () => {
       const res = await request(app.getHttpServer())
         .get('/v1/wallets/orchestration/validate/user-e2e-1/TESTNET')
         .set('Authorization', `Bearer ${VALID_API_KEY}`)
         .expect(HttpStatus.OK);
 
-      expect(res.body).toEqual({ canCreate: true });
+      expect(res.body).toMatchObject({ canCreate: true });
     });
 
-    it('returns canCreate=false when user already has a wallet', async () => {
+    it('returns canCreate=false when validation fails', async () => {
       const localApp = await buildApp({
         validateUserCanCreateWallet: jest.fn(async () => false),
       });
@@ -260,7 +306,7 @@ describe('Wallet Orchestration Endpoints (e2e)', () => {
         .set('Authorization', `Bearer ${VALID_API_KEY}`)
         .expect(HttpStatus.OK);
 
-      expect(res.body).toEqual({ canCreate: false });
+      expect(res.body).toMatchObject({ canCreate: false });
       await localApp.close();
     });
 

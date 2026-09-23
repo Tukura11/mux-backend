@@ -4,6 +4,11 @@
 
 This runbook provides procedures for detecting, diagnosing, and recovering from failed database migrations in the Mux Backend API.
 
+> **Key management migrations:** For the custody key-management migration path (versioned key envelopes, fail-closed decrypt, authz), see the dedicated [Key Management Migration Runbook](#key-management-migration-runbook) section below and the cross-linked references:
+> - [`docs/MIGRATION-KEY-MANAGEMENT.md`](./MIGRATION-KEY-MANAGEMENT.md)
+> - [`docs/key-management-consolidation.md`](./key-management-consolidation.md)
+> - [`docs/custody-security-model.md`](./custody-security-model.md)
+
 ## Quick Reference
 
 | Scenario | Steps | Recovery Time |
@@ -12,6 +17,7 @@ This runbook provides procedures for detecting, diagnosing, and recovering from 
 | Syntax error | Fix schema → Rollback → Retry | 10-15 min |
 | Constraint violation | Backfill data → Rollback → Retry | 15-30 min |
 | Lock timeout | Kill blocking query → Retry | 5 min |
+| Key envelope migration failure | Halt writes → Verify version → Rollback → Retry | 15-30 min |
 
 ---
 
@@ -179,6 +185,72 @@ psql -U $DB_USER -d $DB_NAME -c "SELECT * FROM pg_stat_activity WHERE state = 'a
 
 ---
 
+## Key Management Migration Runbook
+
+This section covers the custody **key-management migration** path: versioned key envelopes (`wallet_key_version`), fail-closed decrypt, and authz enforcement. It complements [`docs/MIGRATION-KEY-MANAGEMENT.md`](./MIGRATION-KEY-MANAGEMENT.md) and [`docs/key-management-consolidation.md`](./key-management-consolidation.md).
+
+### Invariants (must hold at all times)
+
+1. **Server is source of truth.** Spends, recovery, and admin actions are authorized server-side; clients cannot bypass policy.
+2. **Fail-closed decrypt.** If a key envelope cannot be decrypted or its version is unknown, the operation MUST fail with a stable error code — never fall back to plaintext or an older key.
+3. **Version monotonicity.** `wallet_key_version` only increases; downgrades are rejected.
+4. **Idempotency.** Replayed migration requests with the same idempotency key return the original result and do not re-encrypt.
+5. **No secret leakage.** Logs/metrics never contain raw key material, JWTs, or webhook secrets; only correlation ids and version numbers.
+6. **Deny-by-default.** New privileged surfaces require explicit owner/delegate/guardian/API-key/JWT authorization.
+
+### Typed entrypoints & stable error codes
+
+Key-management operations return the shared error envelope (`src/common/dto/error-envelope.dto.ts`) with a stable `code` and a `correlationId`:
+
+| Operation | Entrypoint | Authz | Stable error codes |
+|-----------|-----------|-------|--------------------|
+| Rotate key envelope | `POST /keys/rotate` | owner / guardian | `KEY_VERSION_CONFLICT`, `KEY_DECRYPT_FAILED`, `AUTHZ_DENIED` |
+| Migrate wallet key | `POST /wallets/:id/key/migrate` | owner / delegate | `KEY_MIGRATION_REPLAYED`, `KEY_VERSION_UNKNOWN`, `AUTHZ_DENIED` |
+| Read key metadata | `GET /wallets/:id/key` | owner / delegate / API-key | `KEY_NOT_FOUND`, `AUTHZ_DENIED` |
+
+All responses include a `correlationId` for tracing; errors are actionable and never echo key material.
+
+### Authz enforcement
+
+- **Owner / delegate / guardian** roles are checked server-side before any key mutation.
+- **API-key / JWT** callers are scoped; revoked delegates are rejected (`AUTHZ_DENIED`).
+- Expired tokens fail closed; no privileged surface is reachable without an explicit allow.
+
+### Recovery procedure: failed key-envelope migration
+
+**Symptoms:**
+- `KEY_DECRYPT_FAILED` or `KEY_VERSION_UNKNOWN` in logs
+- Writes to the money path failing closed
+
+**Steps:**
+
+1. **Halt writes** to the affected money path (enable the key-migration kill-switch / feature flag).
+   ```bash
+   kubectl set env deployment/mux-api KEY_MIGRATION_ENABLED=false
+   ```
+
+2. **Verify envelope versions** (no raw key material is read or logged):
+   ```bash
+   psql -U $DB_USER -d $DB_NAME -c "SELECT id, wallet_key_version FROM wallets WHERE wallet_key_version IS NULL OR wallet_key_version < 1;"
+   ```
+
+3. **Roll back the failed migration** (see Scenario 1) and confirm `_prisma_migrations` shows it as rolled back.
+
+4. **Re-run the migration** behind the flag, then re-enable writes:
+   ```bash
+   npm run prisma:migrate:deploy
+   kubectl set env deployment/mux-api KEY_MIGRATION_ENABLED=true
+   ```
+
+5. **Verify** with the integrity checks below and confirm no `KEY_*` errors in logs.
+
+### Rollback / kill-switch
+
+- The key-migration change is gated by `KEY_MIGRATION_ENABLED`; disabling it reverts to the previous (pre-migration) code path without data loss.
+- Rollback is safe because envelopes are additive: old versions remain readable until explicitly retired.
+
+---
+
 ## Verification
 
 ### After Any Recovery Attempt
@@ -203,7 +275,7 @@ psql -U $DB_USER -d $DB_NAME -c "SELECT * FROM pg_stat_activity WHERE state = 'a
 
 4. **Monitor application health**
    ```bash
-   kubectl logs -f deployment/mux-api -c mux-api | grep -E "ERROR|WARN|migration"
+   kubectl logs -f deployment/mux-api -c mux-api | grep -E "ERROR|WARN|migration|KEY_"
    ```
 
 ---
@@ -261,6 +333,9 @@ ALTER TABLE payments ALTER COLUMN assetCode SET NOT NULL;
 | `deadlock detected` | Concurrent migrations | Ensure migrations run serially, check app replicas |
 | `statement timeout` | Large table operation | Increase timeout or break into smaller batches |
 | `disk space low` | Insufficient storage | Add disk space or clean old transaction logs |
+| `KEY_DECRYPT_FAILED` | Envelope unreadable / wrong key | Halt writes, verify `wallet_key_version`, roll back, retry |
+| `KEY_VERSION_CONFLICT` | Concurrent rotation | Retry with idempotency key; ensure serial rotation |
+| `AUTHZ_DENIED` | Wrong role / revoked delegate | Verify owner/delegate/guardian or API-key/JWT scope |
 
 ---
 
@@ -268,29 +343,10 @@ ALTER TABLE payments ALTER COLUMN assetCode SET NOT NULL;
 
 **Immediate:**
 - Migration stuck > 30 minutes
-- Multiple rollback failures
-- Production data corruption suspected
+- Multiple `KEY_*` errors on the money path
+- Suspected key-material exposure (rotate immediately, follow [`docs/custody-security-model.md`](./custody-security-model.md))
 
-**Contact:**
-- On-call DBA: `@dba-oncall` (Slack)
-- Database team: `database-team@mux-labs.com`
-- CTO: For critical data loss scenarios
-
----
-
-## Audit & Compliance
-
-All failed migrations are tracked via `MigrationRecoveryService`:
-- Logged to application logs
-- Recovery actions recorded in service state
-- Use for post-incident analysis
-
-**Retention:** 30 days in recovery service memory (logs permanent in ELK)
-
----
-
-## Related Documentation
-
-- [Prisma Migrations Guide](https://www.prisma.io/docs/orm/prisma-migrate/understanding-prisma-migrate)
-- [PostgreSQL Transaction Handling](https://www.postgresql.org/docs/current/runtime-config-client.html)
-- [Mux Backend Architecture](../docs/architecture.md)
+**Contacts:**
+- On-call engineer (PagerDuty)
+- Database team
+- Security team (for key-material incidents)

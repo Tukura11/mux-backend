@@ -21,7 +21,35 @@ supplying a `successor_id` or any other field.
 JWTs and API keys are redacted from logs and error payloads. Never echo raw key
 material, JWTs, or webhook secrets in responses.
 
-## Correlation IDs
+## Authorization
+
+Wallet orchestration is deny-by-default. Every orchestration entrypoint
+requires a valid API key **and** an authenticated principal, and the caller
+must be the wallet owner or an explicitly granted delegate/guardian for the
+target `userId`/`network` pair. Requests that present a valid API key but no
+matching owner/delegate/guardian grant are rejected with `403`; requests with
+no credentials at all are rejected with `401`. A revoked delegate is treated
+exactly like a missing grant. Clients cannot bypass policy by supplying a
+`userId` in the body or path that they do not own.
+
+## Error codes
+
+Orchestration responses use a stable error envelope. Every error carries a
+`code`, a human-readable `message`, and a `correlationId` that matches the
+`X-Request-Id` response header so operators can trace a single request across
+logs and metrics.
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `WALLET_UNAUTHORIZED` | `401` | Missing or invalid credentials. |
+| `WALLET_FORBIDDEN` | `403` | Authenticated but not owner/delegate/guardian. |
+| `WALLET_NOT_FOUND` | `404` | No wallet for the requested user/network. |
+| `WALLET_ALREADY_EXISTS` | `409` | Active wallet already exists for the pair. |
+| `WALLET_IDEMPOTENCY_CONFLICT` | `409` | Idempotency key reused for a different user/network. |
+| `WALLET_DEPENDENCY_UNAVAILABLE` | `503` | Key-management or RPC dependency failed; write was not committed. |
+| `WALLET_ORCHESTRATION_DISABLED` | `503` | Feature flag is off for this network. |
+
+## Idempotency
 
 Every request may carry `X-Correlation-Id`. If absent, the server generates one
 and returns it in the response header. All error responses include the same
